@@ -1,0 +1,308 @@
+---
+title: "Chip-seq_Analysis"
+author: "Jihwan Lim & Inkyun Park"
+date: "2022-12-22"
+output: html_document
+---
+# Chip_seq Analysis
+
+## General info
+
+Read length: 40bp.
+
+Single/paired end sequencing: single end sequencing.
+
+Started from fastq files provided by encode.
+
+Platform used: Illumina HiSeq 2000.
+
+## Load in necessary packages
+```{r warning=FALSE, results='hide', message=FALSE}
+library(DiffBind)
+library(tidyverse)
+library(GenomicRanges)
+library(org.Hs.eg.db)
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+library(AnnotationDbi)
+```
+
+## Read broadPeak
+
+```{r}
+# combined broadpeak file for combine of two untreated PC9 cell samples
+d0 <- read.table("/Users/jihwanlim/Desktop/Ghent/Msc/Applied_High-throughput_Analysis/Project/CHIP_seq/BAM/H3K4me3_contorl_peaks.broadPeak", header=F,skip=1)
+colnames(d0) <-c("seqnames","start","end","id","score","strand","enrichment","log10p","log10q")
+
+# combined broadpeak file for combine of two treated with Erlotinib for 11 days PC9 cell samples
+d11 <- read.table("/Users/jihwanlim/Desktop/Ghent/Msc/Applied_High-throughput_Analysis/Project/CHIP_seq/BAM/H3K4me3_treat_peaks.broadPeak", header=F,skip=1)
+colnames(d11) <-c("seqnames","start","end","id","score","strand","enrichment","log10p","log10q")
+```
+
+### add "chr" before chromosome ID (1 -> chr1)
+
+```{r}
+d0$seqnames = paste("chr", d0$seqnames, sep ="")
+d11$seqnames <- paste("chr", d11$seqnames, sep ="")
+```
+
+### Adjust strand data
+
+```{r}
+d0$strand <-as.factor("*")
+d11$strand <-as.factor("*")
+```
+
+```{r}
+head(d0, 10)
+head(d11, 10)
+```
+
+## Analysis
+
+### Make GRanges object
+
+```{r}
+bed0 <- with(d0, GRanges(seqnames, IRanges(start, end), strand, score, refseq=id))
+bed11 <- with(d11, GRanges(seqnames, IRanges(start, end), strand, score, refseq=id))
+head(bed0 ,10)
+head(bed11, 10)
+```
+
+### Extract gene data
+
+```{r}
+hg38 <- genes(TxDb.Hsapiens.UCSC.hg38.knownGene)
+```
+
+### Make overlap
+
+```{r}
+ranges0 <- subsetByOverlaps(hg38,bed0, ignore.strand = T)
+ranges11 <- subsetByOverlaps(hg38,bed11, ignore.strand = T)
+```
+
+### Get gene annotation
+
+```{r}
+symbols0 <- unique(ranges0@elementMetadata$gene_id)
+bed_c <- AnnotationDbi::select(org.Hs.eg.db, symbols0, c('SYMBOL', 'GENENAME'))
+
+symbols11 <- unique(ranges11@elementMetadata$gene_id)
+bed_t <- AnnotationDbi::select(org.Hs.eg.db, symbols11, c('SYMBOL', 'GENENAME'))
+```
+
+### Search for genes of interest
+
+```{r}
+colnames(bed_c) <- c("Entrez_ID","Gene_Symbol","Gene_Name")
+colnames(bed_t) <- c("Entrez_ID","Gene_Symbol","Gene_Name")
+```
+
+```{R}
+head(bed_c[grepl("CDH",bed_c$Gene_Symbol),], 10)
+head(bed_t[grepl("CDH",bed_t$Gene_Symbol),], 10)
+```
+
+### Save results
+
+```{r}
+write.table(bed_c,file="ChIPgenes_c.txt",col.names = T,row.names = F,quote = F, sep="\t")
+write.table(bed_t,file="ChIPgenes_t.txt",col.names = T,row.names = F,quote = F, sep="\t")
+
+# Sorting and only keep unique gnene
+bed_c <- unique(sort(bed_c$Gene_Symbol))
+bed_t <- unique(sort(bed_t$Gene_Symbol))
+```
+
+## Visualization
+
+### Remove the unusual chromosome names
+
+```{r}
+subset_c <- d0[d0$seqnames %in% paste0("chr", c(1:21, "X", "Y")),]
+subset_t <- d11[d11$seqnames %in% paste0("chr", c(1:21, "X", "Y")),]
+```
+
+### Turn the strand information back into "."
+
+```{r}
+subset_c$strand <- "."
+subset_t$strand <- "."
+```
+
+### Write to visualization file
+
+```{r}
+## Write to visualization file
+write('track type=broadPeak visibility=3 db=hg38 name="H3k4me" description="H3k4me enrichment"', file = "H3k4me3c_track.broadPeak")
+write.table(subset_c, file = "H3k4me3c_track.broadPeak", append=T, sep = "\t", quote =F, row.names=F, col.names=F)
+
+write('track type=broadPeak visibility=3 db=hg38 name="H3k4me" description="H3k4me enrichment"', file = "H3k4me3t_track.broadPeak")
+write.table(subset_t, file = "H3k4me3t_track.broadPeak", append=T, sep = "\t", quote =F, row.names=F, col.names=F)
+```
+
+## Differential enrichment analysis
+
+Comparing the peaks identified by each of the treatment against each other. We can analyze what binding regions are present in contorol samples, but treated samples in PC9 cell lines (and vice versa)
+
+### Reading in Peaksets
+
+```{r}
+PC9 <- dba(sampleSheet="/Users/jihwanlim/Desktop/Ghent/Msc/Applied_High-throughput_Analysis/Project/PC9.csv")
+dbObj <- dba(PC9)
+dbObj
+```
+
+### Affinity binding matrix
+
+Compute count information for each of the peak/regions
+
+```{r}
+dbObj <- dba.count(dbObj, bUseSummarizeOverlaps=T)
+dbObj
+```
+
+### Explortry data analysis
+
+```{r}
+# PCA plot
+dba.plotPCA(dbObj,  attributes=DBA_TREATMENT, label=DBA_ID)
+```
+
+```{r}
+# Plot correlation heatmap
+plot(dbObj)
+```
+
+### Establishing a contrast
+
+```{r}
+dbObj <- dba.contrast(dbObj,minMembers = 2, categories=DBA_TREATMENT, design = F, block=DBA_REPLICATE)
+```
+
+### Perform the differential enrichment analysis
+
+```{R warning=FALSE, results='hide', message=FALSE}
+# Perform both DESeq2 and edgeR method for analysis
+dbObj <- dba.analyze(dbObj, method=DBA_ALL_METHODS,bGreylist = F)
+```
+
+```{r}
+dba.show(dbObj, bContrast=T)
+```
+
+
+```{r}
+# PCA Plot with regions identified as significant with under 0.05 FDR by using DESeq2
+dba.plotPCA(dbObj, contrast=1, method=DBA_DESEQ2, attributes=DBA_TREATMENT, label=DBA_ID, th = 0.05)
+```
+### Visualizing the results
+
+```{R}
+dba.plotVenn(dbObj,contrast=1,method=DBA_ALL_METHODS)
+```
+
+```{r}
+# MA Plot
+dba.plotMA(dbObj, method=DBA_DESEQ2)
+```
+
+```{r}
+dba.plotMA(dbObj, bXY=TRUE)
+```
+
+```{r}
+pvals <- dba.plotBox(dbObj)
+```
+### Extract results
+
+```{r}
+#Extract full results from DESeq2
+res_deseq <- dba.report(dbObj, method=DBA_DESEQ2, contrast = 1, th=1)
+head(res_deseq ,10)
+```
+
+```{r}
+# Add chr bbefore chromosome ID
+diff_data <- as.data.frame(res_deseq)
+diff_data$seqnames <- paste("chr", diff_data$seqnames, sep ="")
+res_deseq@seqnames <- Rle(diff_data$seqnames)
+```
+
+```{r}
+# Write to file
+out <- as.data.frame(res_deseq)
+write.table(out, file="/Users/jihwanlim/Desktop/Ghent/Msc/Applied_High-throughput_Analysis/Project/CHIP_seq/Control_vs_Erlotinib_deseq2.txt", sep="\t", quote=F, row.names=F)
+```
+
+### Extract bed files for furhter down stream analysis (Visualization)
+
+```{R}
+# Create bed files for each keeping only significant peaks (p < 0.05)
+
+Control_enrich <- out %>% 
+  filter(FDR < 0.05 & Fold > 0) %>% 
+  dplyr::select(seqnames, start, end)
+
+head(Control_enrich ,10)
+  
+Control_enrich <- Control_enrich[Control_enrich$seqnames %in% paste0("chr", c(1:21, "X", "Y")),]
+# Write to file
+write.table(Control_enrich, file="/Users/jihwanlim/Desktop/Ghent/Msc/Applied_High-throughput_Analysis/Project/Control_enriched.bed", sep="\t", quote=F, row.names=F, col.names=F)
+
+Erlotinib_enrich <- out %>% 
+  filter(FDR < 0.05 & Fold < 0) %>% 
+  dplyr::select(seqnames, start, end)
+
+head(Erlotinib_enrich, 10)
+
+Erlotinib_enrich <- Erlotinib_enrich[Erlotinib_enrich$seqnames %in% paste0("chr", c(1:21, "X", "Y")),]
+# Write to file
+write.table(Erlotinib_enrich, file="/Users/jihwanlim/Desktop/Ghent/Msc/Applied_High-throughput_Analysis/Project/Erlotinib_enriched.bed", sep="\t", quote=F, row.names=F, col.names=F)
+```
+
+### Explore data separately
+
+```{r}
+bed_control <- with(Control_enrich, GRanges(seqnames, IRanges(start, end)))
+bed_treat <- with(Erlotinib_enrich, GRanges(seqnames, IRanges(start, end)))
+```
+
+```{r}
+ranges_control <- subsetByOverlaps(hg38,bed_control, ignore.strand = T)
+ranges_treat <- subsetByOverlaps(hg38,bed_treat, ignore.strand = T)
+```
+
+```{r}
+symbols_control <- unique(ranges_control@elementMetadata$gene_id)
+bed_control <- AnnotationDbi::select(org.Hs.eg.db, symbols_control, c('SYMBOL', 'GENENAME'))
+
+symbols_treat <- unique(ranges_treat@elementMetadata$gene_id)
+bed_treat <- AnnotationDbi::select(org.Hs.eg.db, symbols_treat, c('SYMBOL', 'GENENAME'))
+```
+
+```{r}
+colnames(bed_control) <- c("Entrez_ID","Gene_Symbol","Gene_Name")
+colnames(bed_treat) <- c("Entrez_ID","Gene_Symbol","Gene_Name")
+```
+
+```{r}
+head(bed_control, 10)
+head(bed_treat, 10)
+```
+
+## Find significant genes from each contorl and treatemnt ovelapping with other results
+
+```{r}
+overlap <- read.csv("/Users/jihwanlim/Downloads/overlap_gene.csv")
+```
+
+```{r}
+find_control <- bed_control[bed_control$Gene_Symbol %in% overlap$x,]
+find_treat <- bed_treat[bed_treat$Gene_Symbol %in% overlap$x,]
+```
+
+```{r}
+find_control
+find_treat
+```

@@ -1,0 +1,195 @@
+---
+title: "Data Analysis of Microarray Data of Tumour and Normal Lung Adenocarcinoma Tissues"
+author: "Inkyun Park & Jihwan Lim"
+date: "2022-12-23"
+output:
+  word_document: default
+  html_document: default
+---
+
+Microarray data of lung cancer cells and adjacent normal cells from 6 patients are collected from GSE118370 database. 
+
+```{r warning=FALSE, results='hide',message=FALSE}
+library(GEOquery)
+library(affy)
+library(arrayQualityMetrics)
+library(limma)
+library(biomaRt)
+library(org.Hs.eg.db)
+library(knitr)
+```
+
+
+# Data Preparation
+
+Using `getGEO`, we can download phenotype data of the microarray dataset.
+
+```{r warning=FALSE}
+# Get phenotype data from GSE118370
+GSE118370 <- getGEO('GSE118370',GSEMatrix=TRUE)
+lung_exp <- GSE118370[[1]]
+
+# Check the downloaded data
+head(lung_exp@phenoData@data[["title"]])
+
+# Read filenames from local disk
+filenames <- list.files("./data/", pattern="*.CEL")
+filenames <- paste0("./data/", filenames)
+
+# Call AffyBatch obejct from CEL files and phenotype data
+lung_affybatch <- ReadAffy(filenames = filenames, phenoData=pData(lung_exp))
+
+kable(head(pData(lung_exp)[,-c(3,4,5,7,10:20,22:31)]))
+```
+
+# Preprocessing
+
+## Before preprocessing
+
+Do quality evaluation of raw data and log transformed data. Reports will be downloaded at local computer. We will show boxplotss and density plots to show the effect of preprocessing.
+
+```{r warning=FALSE}
+#assessing quality of raw dataset
+arrayQualityMetrics(lung_exp,
+                    outdir = "report_raw",
+                    force = TRUE,
+                    do.logtransform = FALSE)
+```
+
+![](./report_raw/box.png)
+
+![](./report_raw/dens.svg)
+
+```{r warning=FALSE}
+#assessing quality of log transformed dataset
+arrayQualityMetrics(lung_exp,
+                    outdir = "report_log_transformed",
+                    force = TRUE,
+                    do.logtransform = TRUE)
+```
+
+![](./report_log_transformed/box.png)
+
+![](./report_log_transformed/dens.svg)
+
+## Preprocessing
+
+Do preprocessing using rma function, as well as background correction and quantile normalization.
+
+```{r warning=FALSE}
+lung_RMA <- affy::rma(lung_affybatch, background=TRUE, normalize=TRUE)
+```
+
+Then, do quality evaluation on rma preprocessed data.
+
+```{r warning=FALSE}
+arrayQualityMetrics(expressionset = lung_RMA,
+                    outdir = "report_rma",
+                    force = TRUE)
+```
+
+![](./report_rma/box.png)
+
+![](./report_rma/dens.svg)
+
+# Differential Expression Analysis with RMA preprocessed data
+
+Now, RMA preprocessed data will be used to analyze differential expression between two conditions.
+
+First, we will look up data.
+
+```{r}
+annot <- factor(substr(pData(lung_RMA)[,31], 0, nchar(pData(lung_RMA)[,31])-7))
+```
+
+## Differential Expression by LIMMA
+
+Using `limma`, differential expressed genes can be spotted.
+
+```{r}
+design <- model.matrix(~ 0 + annot)
+colnames(design) <- c("T", "N") #change colnames of design
+
+# Fit genes on linear model
+fit <- lmFit(lung_RMA, design)
+cont.matrix <- makeContrasts(T-N, levels=design)
+
+# Get estimated coefficients and standard error from fit
+fit2 <- contrasts.fit(fit, cont.matrix)
+# To estimate moderated variances
+fit2 <- eBayes(fit2)
+```
+
+### Differential Expression Analysis Results
+
+```{r}
+# Extract DE genes
+LIMMAout <- topTable(fit2,adjust="BH",number=nrow(exprs(lung_RMA)))
+LIMMAout_sig <- LIMMAout[LIMMAout$adj.P.Val < 0.05, ]
+LIMMAout_sig <- LIMMAout_sig[order(LIMMAout_sig$adj.P.Val),]
+kable(head(LIMMAout_sig))
+dim(LIMMAout_sig)
+```
+
+### Plots
+
+There is two ways to check data is making sense.
+In volcano plot, we can look for high or down regulated genes with statistically significant meaning.
+In MA plot, we are expecting horizontal distribution of points. Differentially expressed genes will be located top or botoom of the plot.
+
+```{r}
+#volcano
+volcanoplot(fit2)
+
+#MA plot
+plot(LIMMAout$AveExpr, LIMMAout$logFC,
+     col=as.factor(LIMMAout$adj.P.Val < 0.05), pch=20, cex=0.25, 
+     xlab="Average log Expression", ylab="logFC")
+```
+
+
+# Annotation
+
+To annotate genes with high fold change, we need annotation file of the microarray platform. There, we can find annotations for probe IDs.
+
+```{r}
+# Call annotation file
+annotation_MA <- read.table("GPL570-55999.txt", sep="\t", fill=TRUE,quote="",head=TRUE)
+
+# Extract probe IDs
+probe_ids <- rownames(LIMMAout_sig)
+LIMMAout_sig$entrez_id <- NA
+
+# Annotate probe IDs into entrez gene ID
+for (i in probe_ids) {
+  probe_id <- paste(c(rbind("^", i, "$")), collapse='')
+  entrez_id <- annotation_MA[annotation_MA$ID == i,]$ENTREZ_GENE_ID
+  LIMMAout_sig[i, ]$entrez_id <- entrez_id
+}
+
+LIMMAout_sig$entrez_id <- gsub("\\ .*","",LIMMAout_sig$entrez_id)
+kable(head(LIMMAout_sig))
+```
+
+Perform gene set analysis on differentially expressed genes. As `goana` only takes entrez gene id for the analysis, all genes IDs or symbols should be converted to entrez ID beforehand.
+
+```{r}
+entrez_ids <- LIMMAout_sig$entrez_id
+
+#subset for non duplicated and mapped genes 
+entrez_ids <- entrez_ids[!(duplicated(entrez_ids) | is.na(entrez_ids))]
+
+goana_out <- goana(de=entrez_ids, species="Hs", trend=T)
+
+goana_out <- goana_out[order(goana_out$P.DE, decreasing=FALSE),] 
+goana_out$FDR.DE <- p.adjust(goana_out$P.DE, method="BH")
+topGOcpg <- topGO(goana_out, ontology="BP", number=Inf) 
+kable(head(topGOcpg, 10))
+```
+
+# Save Results
+
+```{r}
+write.csv(LIMMAout_sig, "DEgenes_microarray.csv")
+write.csv(topGOcpg, "GSA_microarray.csv")
+```

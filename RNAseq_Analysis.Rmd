@@ -1,0 +1,209 @@
+---
+title: "Data Analysis of RNA-seq Data of Tumour and Normal Lung Adenocarcinoma Tissues"
+author: "Inkyun Park & Jihwan Lim"
+date: "2022-12-23"
+output:
+  word_document: default
+  html_document: default
+---
+
+RNA sequencing data of lung cancer cells and adjacent normal cells from 3 patients with stage 3 lung cancer are collected from GSE40419 database. Quality control and mapping to reference files using KALLISTO of raw FASTQ files are already done in the HPC.
+
+```{r warning=FALSE, results='hide',message=FALSE}
+# Load necessary packages
+library(biomaRt)
+library(tximport)
+library(edgeR)
+library(limma)
+library(org.Hs.eg.db)
+library(DESeq2)
+library(knitr)
+```
+
+
+# Data Preparation
+
+Get gene ID from reference files to annotate gene ID on the sample data from KALLISTO
+
+```{r}
+# Get annotation data
+human_mart <- useEnsembl("ensembl","hsapiens_gene_ensembl")
+
+# What are the available attributes
+atr <- listAttributes(human_mart)
+
+data <- getBM(attributes = c('ensembl_gene_id', 'ensembl_transcript_id',   
+                             'external_gene_name'),
+              mart = human_mart)
+
+tx2geneGtf <- dplyr::select(data, ensembl_transcript_id, ensembl_gene_id)
+tx2geneGtf <- dplyr::rename(tx2geneGtf, TXNAME = ensembl_transcript_id)
+tx2geneGtf <- dplyr::rename(tx2geneGtf, GENEID = ensembl_gene_id)
+
+kable(head(tx2geneGtf))
+```
+
+## Load data
+
+Load in sample data which is already mapped to genome.
+
+```{r}
+## Get file locations
+files <- list.files("kallisto_quant/")
+files <- files[grep("abundance.tsv",files)]
+samples <- unlist(strsplit(files,"_"))[c(1:length(files))*2-1]
+files <- paste(rep("kallisto_quant/",length(files)),files,sep="")
+names(files) <- samples
+
+## Load RNAseq data
+txi <- tximport(files, type = "kallisto", tx2gene = tx2geneGtf)
+
+## Have a look at the data
+kable(head(txi$counts))
+dim(txi$counts)
+```
+
+
+# Statistical analysis
+
+First, we check duplicated row of the data and make annotation for design.
+
+```{r}
+## Check for duplicate rows
+sum(duplicated(rownames(txi$counts)))
+dim(txi$abundance)
+
+## Make annotation for design later on
+tissue <- factor(c("Tumor","Tumor","Tumor","Normal","Normal","Normal"))
+```
+
+## EdgeR
+
+`edgeR` package is differential expression analysis with statistical models for RNA-seq data.
+
+### Preprocessing
+
+As normalization factors are already calculated with `tximport`, we can next do filtering by cpm (counts-per-million). In filtering, we want to choose genes with certain expression at different 3 samples.
+
+```{r}
+## Make tpm values compatible with edgeR
+cts <- txi$counts
+normMat <- txi$length
+
+# Obtaining per-observation scaling factors for length, adjusted to avoid changing the magnitude of the counts.
+normMat <- normMat/exp(rowMeans(log(normMat)))
+normCts <- cts/normMat
+
+# Computing effective library sizes from scaled counts, to account for composition biases between samples.
+eff.lib <- calcNormFactors(normCts) * colSums(normCts)
+
+# Combining effective library sizes with the length factors, and calculating offsets for a log-link GLM.
+normMat <- sweep(normMat, 2, eff.lib, "*")
+normMat <- log(normMat)
+
+kable(eff.lib)
+
+# Creating a DGEList object for use in edgeR.
+y <- DGEList(cts)
+y <- scaleOffset(y, normMat)
+
+# Estimate cpm threshold value and filter genes with low counts by cpm.
+cutoff <- 3/(mean(y$samples$lib.size)/1000000)
+keep <- rowSums(cpm(y)>cutoff) >= 3
+y <- y[keep, ,keep.lib.sizes=FALSE]
+summary(keep)
+```
+
+Define design matrix based on our experimental design: find differentially expressed genes between tumor and adjacent normal tissues.
+
+```{r}
+design <- model.matrix(~tissue)
+rownames(design) <- colnames(y)
+kable(design)
+```
+
+Plot Multi-Dimensional Scaling plot (MDS) and Biological Coefficient of Variation (BCV).
+
+```{r}
+label <- paste0(tissue, "_", colnames(y))
+limma::plotMDS(y, labels = label)
+
+y <- estimateDisp(y, design, robust=TRUE)
+plotBCV(y)
+```
+
+### Differential Expression Analysis using edgeR
+
+Using edgeR packages, now we can find differentially expressed genes.
+
+```{r}
+# Perform likelihood ratio tests:
+fit <- glmFit(y, design)
+
+# See goodness of the fit.
+gof(fit, plot=TRUE)
+
+lrt <- glmLRT(fit)
+dt <- decideTestsDGE(lrt)
+plotSmear(lrt, de.tags=rownames(y)[as.logical(dt)])
+
+# Summary of up or down regulated genes.
+summary(dt)
+```
+
+We found out that 2425 genes are differentially expressed.
+
+```{r}
+res_edger <- topTags(lrt, n="Inf", sort.by="logFC")
+
+# p-value histogram
+hist(res_edger$table$PValue, 
+     main="p-value histogram from edgeR analysis",
+     xlab = "p-value")
+
+# FDR histogram
+hist(res_edger$table$PValue, 
+     main="FDR histogram from edgeR analysis",
+     xlab = "FDR")
+
+# Select significantly expressed genes
+res_edger_sig <- res_edger[res_edger$table$FDR < 0.05,]$table
+res_edger_sig <- res_edger_sig[order(res_edger_sig$FDR), ]
+kable(head(res_edger_sig))
+dim(res_edger_sig)
+```
+
+### Gene Set Analysis
+
+Perform gene set analysis on differentially expressed genes. 
+
+```{r}
+# Change ensembl gene ID into entrez ID to be compatible with goana function.
+entrez_ids <- mapIds(org.Hs.eg.db, 
+                    keys=rownames(res_edger_sig), 
+                    column="ENTREZID", 
+                    keytype="ENSEMBL")
+
+# Add ensemble gene ID on results from edgeR
+#df1$vector1<-vector1[match(df1$ID,names(vector1))]
+res_edger_sig$entrezIDs <- entrez_ids[match(rownames(res_edger_sig), names(entrez_ids))]
+
+
+#subset for non duplicated and mapped genes
+entrez_ids <- entrez_ids[!(duplicated(entrez_ids) | is.na(entrez_ids))]
+
+goana_out <- goana(de=entrez_ids, species="Hs", trend=T)
+
+goana_out <- goana_out[order(goana_out$P.DE, decreasing=FALSE),] 
+goana_out$FDR.DE <- p.adjust(goana_out$P.DE, method="BH")
+topGOcpg <- topGO(goana_out, ontology="BP", number=Inf) 
+kable(head(topGOcpg, 10))
+dim(topGOcpg)
+```
+
+# Save Results
+
+```{r}
+write.csv(res_edger_sig, "DEgenes_edger_RNAseq.csv")
+write.csv(topGOcpg, "GSA_edger_RNAseq.csv")
+```
